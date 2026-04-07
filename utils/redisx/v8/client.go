@@ -1,3 +1,6 @@
+// Deprecated: Use github.com/moscososirenita-design/tk-common/utils/redisx/v9 instead.
+// This package wraps github.com/go-redis/redis/v8 which is no longer maintained.
+// It is kept only for backward compatibility with external consumers.
 package v8
 
 import (

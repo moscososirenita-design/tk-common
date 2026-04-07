@@ -3,508 +3,329 @@ package logx
 import (
 	"context"
 	"fmt"
-	"io"
-	"log"
 	"os"
-	"path/filepath"
-	"runtime"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/moscososirenita-design/tk-common/utils/ctxx"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-// LogLevel 定义日志等级。
+// LogLevel 定义日志等级（与 zapcore.Level 数值对齐：Debug=0 Info=1 Warn=2 Error=3）。
 type LogLevel int
 
 // 声明日志等级常量。
 const (
-	// LevelDebug 记录调试日志。
 	LevelDebug LogLevel = iota
-	// LevelInfo 记录信息日志。
 	LevelInfo
-	// LevelWarn 记录警告日志。
 	LevelWarn
-	// LevelError 记录错误日志。
 	LevelError
 )
 
-// Logger 定义基础日志记录器。
-type Logger struct {
-	// Level 保存当前日志等级。
-	Level LogLevel
-	// debugLog 处理 debug 级别输出。
-	debugLog *log.Logger
-	// infoLog 处理 info 级别输出。
-	infoLog *log.Logger
-	// warnLog 处理 warn 级别输出。
-	warnLog *log.Logger
-	// errorLog 处理 error 级别输出。
-	errorLog *log.Logger
-	// file 记录文件句柄，便于优雅关闭。
-	file *os.File
-}
-
 // Config 定义日志配置。
 type Config struct {
-	Level      LogLevel  // 日志等级
-	Output     io.Writer // 输出目标
-	FilePath   string    // 文件路径
-	MaxSize    int64     // 最大文件大小（预留）
-	MaxBackups int       // 最大备份数（预留）
-	MaxAge     int       // 最大保存天数（预留）
+	Level             LogLevel // 日志等级
+	FilePath          string   // 预留：文件输出路径
+	MaxSize           int64    // 预留：最大文件大小
+	MaxBackups        int      // 预留：最大备份数
+	MaxAge            int      // 预留：最大保存天数
+	Development       bool     // 开发模式：彩色输出 + panic 级别 stacktrace
+	ServerName        string   // 服务名，写入每条日志的 appName 字段
+	Version           string   // 服务版本
+	DisableStacktrace bool     // 禁用自动 stacktrace（配合 StacktraceLevel 使用）
+	StacktraceLevel   *int     // 指定触发 stacktrace 的最低级别（zapcore.Level）
 }
 
-// LogConfig 与历史命名保持兼容。
+// LogConfig 兼容历史命名。
 type LogConfig = Config
 
 // DefaultConfig 返回默认日志配置。
 func DefaultConfig() Config {
-	// 返回当前处理结果。
-	return Config{
-		// 设置默认等级为 info。
-		Level: LevelInfo,
-		// 默认输出到标准输出。
-		Output: os.Stdout,
-		// 默认不写入文件。
-		FilePath: "",
-	}
+	return Config{Level: LevelInfo}
 }
 
-// DefaultLogConfig 与历史命名保持兼容。
-func DefaultLogConfig() Config {
-	// 返回当前处理结果。
-	return DefaultConfig()
+// DefaultLogConfig 兼容历史命名。
+func DefaultLogConfig() Config { return DefaultConfig() }
+
+// ── 环境检测 ─────────────────────────────────────────────────────────────────
+
+// isDevMode 检查 APP_ENV 环境变量，local/dev/development 视为本地开发环境。
+func isDevMode() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	return env == "local" || env == "dev" || env == "development"
+}
+
+// ── 彩色输出支持 ──────────────────────────────────────────────────────────────
+
+type color string
+
+func (c color) add(s string) string {
+	return fmt.Sprintf(string(c), 0x1B, s, 0x1B)
+}
+
+const (
+	colorMagenta color = "%c[0;42;35m%v%c[0m"
+	colorBlue    color = "%c[0;42;30m%v%c[0m"
+	colorYellow  color = "%c[0;43;30m%v%c[0m"
+	colorRed     color = "%c[0;41;30m%v%c[0m"
+)
+
+var levelColors = map[zapcore.Level]color{
+	zapcore.DebugLevel:  colorMagenta,
+	zapcore.InfoLevel:   colorBlue,
+	zapcore.WarnLevel:   colorYellow,
+	zapcore.ErrorLevel:  colorRed,
+	zapcore.DPanicLevel: colorRed,
+	zapcore.PanicLevel:  colorRed,
+	zapcore.FatalLevel:  colorRed,
+}
+
+func colorLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	c, ok := levelColors[l]
+	if !ok {
+		c = colorRed
+	}
+	enc.AppendString(c.add(l.CapitalString()))
+}
+
+// ── 内部 zap.Logger 构造 ──────────────────────────────────────────────────────
+
+func buildZapLogger(cfg Config) *zap.Logger {
+	encCfg := zap.NewProductionEncoderConfig()
+	encCfg.EncodeTime = zapcore.TimeEncoder(func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(fmt.Sprintf("%v %v", t.Format("2006-01-02 15:04:05.000Z07"), t.UnixMilli()))
+	})
+	dev := cfg.Development || isDevMode()
+	if dev {
+		encCfg.EncodeLevel = colorLevelEncoder
+	} else {
+		encCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+	}
+	encCfg.EncodeCaller = zapcore.ShortCallerEncoder
+	encCfg.EncodeDuration = zapcore.StringDurationEncoder
+
+	// LogLevel 与 zapcore.Level 数值完全对齐，可直接转换
+	zapLevel := zapcore.Level(cfg.Level)
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(encCfg),
+		zapcore.AddSync(os.Stdout),
+		zap.NewAtomicLevelAt(zapLevel),
+	)
+
+	opts := []zap.Option{
+		zap.AddCaller(),
+		zap.AddCallerSkip(1), // 跳过 Logger/ContextLogger 包装层，指向真实调用点
+	}
+	if cfg.ServerName != "" {
+		opts = append(opts, zap.Fields(zap.String("appName", cfg.ServerName)))
+		if cfg.Version != "" {
+			opts = append(opts, zap.Fields(zap.String("version", cfg.Version)))
+		}
+	}
+	if dev {
+		opts = append(opts, zap.Development())
+	}
+	if cfg.DisableStacktrace {
+		level := zapcore.DPanicLevel
+		if cfg.StacktraceLevel != nil {
+			level = zapcore.Level(*cfg.StacktraceLevel)
+		}
+		opts = append(opts, zap.AddStacktrace(level))
+	}
+	return zap.New(core, opts...)
+}
+
+// ── Logger ────────────────────────────────────────────────────────────────────
+
+// Logger 定义基础日志记录器，底层使用 zap.SugaredLogger 实现 printf 风格调用。
+type Logger struct {
+	Level LogLevel
+	zl    *zap.Logger
+	sugar *zap.SugaredLogger
 }
 
 // NewLogger 创建日志记录器。
 func NewLogger(cfg Config) (*Logger, error) {
-	// 声明当前变量。
-	var output io.Writer = cfg.Output
-	// 声明当前变量。
-	var file *os.File
-
-	// 判断条件并进入对应分支逻辑。
-	if output == nil {
-		// 未设置输出时，回退到标准输出。
-		output = os.Stdout
-	}
-
-	// 判断条件并进入对应分支逻辑。
-	if cfg.FilePath != "" {
-		// 确保日志目录存在。
-		dir := filepath.Dir(cfg.FilePath)
-		// 判断条件并进入对应分支逻辑。
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			// 返回当前处理结果。
-			return nil, fmt.Errorf("failed to create log directory: %w", err)
-		}
-
-		// 以追加模式打开日志文件。
-		f, err := os.OpenFile(cfg.FilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		// 判断条件并进入对应分支逻辑。
-		if err != nil {
-			// 返回当前处理结果。
-			return nil, fmt.Errorf("failed to open log file: %w", err)
-		}
-		// 更新当前变量或字段值。
-		file = f
-		// 更新当前变量或字段值。
-		output = f
-
-		// 若原输出是终端，则同时写终端和文件。
-		if cfg.Output == os.Stdout || cfg.Output == os.Stderr {
-			// 更新当前变量或字段值。
-			output = io.MultiWriter(cfg.Output, f)
-		}
-	}
-
-	// 返回当前处理结果。
+	zl := buildZapLogger(cfg)
 	return &Logger{
-		// 写入配置的日志等级。
 		Level: cfg.Level,
-		// 初始化 debug 日志器。
-		debugLog: log.New(output, "[DEBUG] ", log.Ldate|log.Ltime|log.Lshortfile),
-		// 初始化 info 日志器。
-		infoLog: log.New(output, "[INFO]  ", log.Ldate|log.Ltime|log.Lshortfile),
-		// 初始化 warn 日志器。
-		warnLog: log.New(output, "[WARN]  ", log.Ldate|log.Ltime|log.Lshortfile),
-		// 初始化 error 日志器。
-		errorLog: log.New(output, "[ERROR] ", log.Ldate|log.Ltime|log.Lshortfile),
-		// 保存文件句柄用于关闭。
-		file: file,
+		zl:    zl,
+		sugar: zl.Sugar(),
 	}, nil
 }
 
-// ContextLogger 定义带上下文的日志记录器。
+// GetZapLogger 返回底层 *zap.Logger，供框架适配器（gorm、gin 等）使用。
+func (l *Logger) GetZapLogger() *zap.Logger { return l.zl }
+
+func (l *Logger) Debug(format string, v ...interface{}) { l.sugar.Debugf(format, v...) }
+func (l *Logger) Info(format string, v ...interface{})  { l.sugar.Infof(format, v...) }
+func (l *Logger) Warn(format string, v ...interface{})  { l.sugar.Warnf(format, v...) }
+func (l *Logger) Error(format string, v ...interface{}) { l.sugar.Errorf(format, v...) }
+func (l *Logger) Fatal(format string, v ...interface{}) { l.sugar.Fatalf(format, v...) }
+
+// Close 刷新 zap 缓冲并关闭底层资源。
+func (l *Logger) Close() error { _ = l.zl.Sync(); return nil }
+
+// WithContext 绑定上下文，返回 ContextLogger。
+func (l *Logger) WithContext(ctx context.Context) *ContextLogger {
+	return NewContextLogger(ctx, l)
+}
+
+// ── ContextLogger ─────────────────────────────────────────────────────────────
+
+// ContextLogger 定义带请求上下文的日志记录器，自动附加 request_id 字段。
 type ContextLogger struct {
 	*Logger
-	// ctx 保存请求上下文，便于输出 request_id。
 	ctx context.Context
 }
 
 // NewContextLogger 创建带上下文日志记录器。
 func NewContextLogger(ctx context.Context, logger *Logger) *ContextLogger {
-	// 返回当前处理结果。
-	return &ContextLogger{
-		// 注入底层 Logger。
-		Logger: logger,
-		// 注入上下文。
-		ctx: ctx,
-	}
+	return &ContextLogger{Logger: logger, ctx: ctx}
 }
 
-// WithContext 绑定上下文。
-func (l *Logger) WithContext(ctx context.Context) *ContextLogger {
-	// 返回当前处理结果。
-	return NewContextLogger(ctx, l)
-}
-
-// getCallerInfo 获取调用位置信息。
-func getCallerInfo() string {
-	// 跳过包装层栈帧，返回真实调用点。
-	_, file, line, ok := runtime.Caller(3)
-	// 判断条件并进入对应分支逻辑。
-	if !ok {
-		// 返回当前处理结果。
-		return ""
+// contextSugar 从 ctx 提取 request_id，返回携带该字段的 SugaredLogger。
+func (cl *ContextLogger) contextSugar() *zap.SugaredLogger {
+	if cl.ctx == nil {
+		return cl.sugar
 	}
-	// 返回当前处理结果。
-	return fmt.Sprintf("%s:%d", filepath.Base(file), line)
-}
-
-// buildContextPrefix 构建 request_id 前缀。
-func (cl *ContextLogger) buildContextPrefix() string {
-	// 判断条件并进入对应分支逻辑。
-	if cl == nil || cl.ctx == nil {
-		// 返回当前处理结果。
-		return ""
-	}
-	// 定义并初始化当前变量。
 	reqID := ctxx.RequestIDFromContext(cl.ctx)
-	// 判断条件并进入对应分支逻辑。
 	if reqID == "" {
-		// 返回当前处理结果。
-		return ""
+		return cl.sugar
 	}
-	// 返回当前处理结果。
-	return fmt.Sprintf("[req:%s] ", reqID)
+	return cl.sugar.With("request_id", reqID)
 }
 
-// Debug 记录调试日志。
-func (l *Logger) Debug(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if l.Level > LevelDebug {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s %s", caller, format)
-	}
-	// 输出 debug 日志。
-	l.debugLog.Printf(format, v...)
-}
-
-// Info 记录信息日志。
-func (l *Logger) Info(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if l.Level > LevelInfo {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s %s", caller, format)
-	}
-	// 输出 info 日志。
-	l.infoLog.Printf(format, v...)
-}
-
-// Warn 记录警告日志。
-func (l *Logger) Warn(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if l.Level > LevelWarn {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s %s", caller, format)
-	}
-	// 输出 warn 日志。
-	l.warnLog.Printf(format, v...)
-}
-
-// Error 记录错误日志。
-func (l *Logger) Error(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if l.Level > LevelError {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s %s", caller, format)
-	}
-	// 输出 error 日志。
-	l.errorLog.Printf(format, v...)
-}
-
-// Fatal 输出致命日志并退出进程。
-func (l *Logger) Fatal(format string, v ...interface{}) {
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s %s", caller, format)
-	}
-	// 输出 fatal 日志并终止进程。
-	l.errorLog.Fatalf(format, v...)
-}
-
-// Debug 记录带上下文的调试日志。
 func (cl *ContextLogger) Debug(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if cl.Level > LevelDebug {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	prefix := cl.buildContextPrefix()
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s %s", prefix, caller, format)
-	} else {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s", prefix, format)
-	}
-	// 输出 debug 日志。
-	cl.debugLog.Printf(format, v...)
+	cl.contextSugar().Debugf(format, v...)
 }
-
-// Info 记录带上下文的信息日志。
 func (cl *ContextLogger) Info(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if cl.Level > LevelInfo {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	prefix := cl.buildContextPrefix()
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s %s", prefix, caller, format)
-	} else {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s", prefix, format)
-	}
-	// 输出 info 日志。
-	cl.infoLog.Printf(format, v...)
+	cl.contextSugar().Infof(format, v...)
 }
-
-// Warn 记录带上下文的警告日志。
 func (cl *ContextLogger) Warn(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if cl.Level > LevelWarn {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	prefix := cl.buildContextPrefix()
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s %s", prefix, caller, format)
-	} else {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s", prefix, format)
-	}
-	// 输出 warn 日志。
-	cl.warnLog.Printf(format, v...)
+	cl.contextSugar().Warnf(format, v...)
 }
-
-// Error 记录带上下文的错误日志。
 func (cl *ContextLogger) Error(format string, v ...interface{}) {
-	// 判断条件并进入对应分支逻辑。
-	if cl.Level > LevelError {
-		// 返回当前处理结果。
-		return
-	}
-	// 定义并初始化当前变量。
-	prefix := cl.buildContextPrefix()
-	// 定义并初始化当前变量。
-	caller := getCallerInfo()
-	// 判断条件并进入对应分支逻辑。
-	if caller != "" {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s %s", prefix, caller, format)
-	} else {
-		// 更新当前变量或字段值。
-		format = fmt.Sprintf("%s%s", prefix, format)
-	}
-	// 输出 error 日志。
-	cl.errorLog.Printf(format, v...)
+	cl.contextSugar().Errorf(format, v...)
+}
+func (cl *ContextLogger) Fatal(format string, v ...interface{}) {
+	cl.contextSugar().Fatalf(format, v...)
 }
 
-// Close 关闭日志文件句柄。
-func (l *Logger) Close() error {
-	// 判断条件并进入对应分支逻辑。
-	if l.file != nil {
-		// 返回当前处理结果。
-		return l.file.Close()
-	}
-	// 返回当前处理结果。
-	return nil
-}
+// ── 全局 Logger 单例 ──────────────────────────────────────────────────────────
 
-// 声明全局日志实例与锁，避免并发读写冲突。
 var (
-	// globalMu 保护 globalLogger。
-	globalMu sync.RWMutex
-	// globalLogger 保存进程级 logger。
+	globalMu     sync.RWMutex
 	globalLogger *Logger
+	// ginZapLogger 专用于 gin 访问日志（不携带调用者信息）
+	ginZapLogger *zap.Logger
 )
 
-// InitGlobalLogger 初始化全局日志器。
+func init() {
+	// 保证进程启动即有可用 logger，各服务启动时调用 InitGlobalLogger 覆盖配置
+	_ = InitGlobalLogger(DefaultConfig())
+}
+
+// InitGlobalLogger 使用指定配置初始化全局日志器，同时更新框架适配器。
 func InitGlobalLogger(cfg Config) error {
-	// 定义并初始化当前变量。
-	logger, err := NewLogger(cfg)
-	// 判断条件并进入对应分支逻辑。
+	l, err := NewLogger(cfg)
 	if err != nil {
-		// 返回当前处理结果。
 		return err
 	}
-	// 加锁写入全局实例。
 	globalMu.Lock()
-	// 更新当前变量或字段值。
-	globalLogger = logger
-	// 调用globalMu.Unlock完成当前处理。
+	globalLogger = l
+	ginZapLogger = l.zl.WithOptions(zap.WithCaller(false))
 	globalMu.Unlock()
-	// 返回当前处理结果。
 	return nil
 }
 
-// GetLogger 获取全局日志器；若未初始化则使用默认配置。
-func GetLogger() *Logger {
-	// 先尝试读锁快速路径。
-	globalMu.RLock()
-	// 定义并初始化当前变量。
-	current := globalLogger
-	// 调用globalMu.RUnlock完成当前处理。
-	globalMu.RUnlock()
-	// 判断条件并进入对应分支逻辑。
-	if current != nil {
-		// 返回当前处理结果。
-		return current
-	}
+// InitDefaultLogger 使用服务名和版本号初始化全局日志器（便捷入口）。
+func InitDefaultLogger(serverName, version string) {
+	cfg := DefaultConfig()
+	cfg.ServerName = serverName
+	cfg.Version = version
+	_ = InitGlobalLogger(cfg)
+}
 
-	// 慢路径：初始化默认 logger。
-	globalMu.Lock()
-	// 注册延迟执行逻辑。
-	defer globalMu.Unlock()
-	// 判断条件并进入对应分支逻辑。
-	if globalLogger == nil {
-		// 定义并初始化当前变量。
-		logger, _ := NewLogger(DefaultConfig())
-		// 更新当前变量或字段值。
-		globalLogger = logger
+// GetLogger 获取全局日志器；若未初始化则自动使用默认配置。
+func GetLogger() *Logger {
+	globalMu.RLock()
+	l := globalLogger
+	globalMu.RUnlock()
+	if l != nil {
+		return l
 	}
-	// 返回当前处理结果。
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	if globalLogger == nil {
+		l, _ := NewLogger(DefaultConfig())
+		globalLogger = l
+		ginZapLogger = l.zl.WithOptions(zap.WithCaller(false))
+	}
 	return globalLogger
 }
 
-// LoggerFromContext 从上下文提取日志器。
+// GetZapLogger 返回全局底层 *zap.Logger，供框架适配器使用。
+func GetZapLogger() *zap.Logger {
+	return GetLogger().GetZapLogger()
+}
+
+// LoggerFromContext 从上下文提取 ContextLogger；若未注入则返回绑定了 ctx 的全局 logger。
 func LoggerFromContext(ctx context.Context) *ContextLogger {
-	// 判断条件并进入对应分支逻辑。
 	if ctxLogger, ok := ctxx.Get[*ContextLogger](ctx, ctxx.LoggerKey); ok && ctxLogger != nil {
-		// 返回当前处理结果。
 		return ctxLogger
 	}
-	// 兼容历史字符串键读取。
+	// 兼容历史字符串键
 	if ctx != nil {
-		// 判断条件并进入对应分支逻辑。
 		if logger, ok := ctx.Value("logger").(*ContextLogger); ok {
-			// 返回当前处理结果。
 			return logger
 		}
 	}
-	// 返回当前处理结果。
 	return GetLogger().WithContext(ctx)
 }
 
-// WithContextLogger 写入上下文日志器。
+// WithContextLogger 将 ContextLogger 写入 context，便于在调用链中传递。
 func WithContextLogger(ctx context.Context, logger *ContextLogger) context.Context {
-	// 返回当前处理结果。
 	return ctxx.With(ctx, ctxx.LoggerKey, logger)
 }
 
-// WithRequestID 写入请求 ID。
+// WithRequestID 将请求 ID 写入 context。
 func WithRequestID(ctx context.Context, requestID string) context.Context {
-	// 返回当前处理结果。
 	return ctxx.With(ctx, ctxx.RequestIDKey, requestID)
 }
 
-// LogLevelFromString 将字符串转为日志级别。
+// ── 工具函数 ──────────────────────────────────────────────────────────────────
+
+// LogLevelFromString 将字符串解析为日志级别。
 func LogLevelFromString(level string) LogLevel {
-	// 根据表达式进入多分支处理。
-	switch level {
+	switch strings.ToLower(level) {
 	case "debug":
-		// 返回当前处理结果。
 		return LevelDebug
 	case "info":
-		// 返回当前处理结果。
 		return LevelInfo
 	case "warn":
-		// 返回当前处理结果。
 		return LevelWarn
 	case "error":
-		// 返回当前处理结果。
 		return LevelError
 	default:
-		// 返回当前处理结果。
 		return LevelInfo
 	}
 }
 
 // StringFromLogLevel 将日志级别转为字符串。
 func StringFromLogLevel(level LogLevel) string {
-	// 根据表达式进入多分支处理。
 	switch level {
 	case LevelDebug:
-		// 返回当前处理结果。
 		return "debug"
 	case LevelInfo:
-		// 返回当前处理结果。
 		return "info"
 	case LevelWarn:
-		// 返回当前处理结果。
 		return "warn"
 	case LevelError:
-		// 返回当前处理结果。
 		return "error"
 	default:
-		// 返回当前处理结果。
 		return "info"
 	}
 }

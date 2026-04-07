@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// defaultTransport 全局共享的 HTTP Transport，复用 TCP 连接池，
+// 避免每次创建 Client 时新建连接导致 TIME_WAIT 堆积。
+var defaultTransport = &http.Transport{
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 10,
+	IdleConnTimeout:     90 * time.Second,
+}
+
 // NewTimeoutClient 创建带超时的 HTTP 客户端。
 func NewTimeoutClient(timeout time.Duration) *http.Client {
 	// 判断条件并进入对应分支逻辑。
@@ -16,7 +24,7 @@ func NewTimeoutClient(timeout time.Duration) *http.Client {
 		timeout = 3 * time.Second
 	}
 	// 返回当前处理结果。
-	return &http.Client{Timeout: timeout}
+	return &http.Client{Timeout: timeout, Transport: defaultTransport}
 }
 
 // GetRange 发起带 Range 头的 GET 请求并读取有限字节。
